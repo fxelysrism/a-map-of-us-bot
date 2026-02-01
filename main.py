@@ -1,15 +1,17 @@
 import os
+import json
+from datetime import datetime, time as dt_time
+from typing import Optional, Any, Dict
+
 import aiohttp
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
-from discord.ext import tasks
-from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
-import json
 
 API_BASE = "https://api.amapof.us/mous"
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+
 DAILY_CHANNEL_ID = 1466859419781435392
 DAILY_TIMEZONE = "Europe/London"
 DAILY_STATE_FILE = "daily_post.json"
@@ -18,15 +20,16 @@ DAILY_STATE_FILE = "daily_post.json"
 class MousBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        # Reaction roles require members + reaction events.
         intents.members = True
         intents.reactions = True
-        # Enable if you want keyword-based auto reactions.
-        intents.message_content = True
+        intents.message_content = True  # Requires enabling Message Content Intent in Discord Dev Portal
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
+        # Sync slash commands
         await self.tree.sync()
+
+        # Start daily task once
         if not daily_mous.is_running():
             daily_mous.start()
 
@@ -36,36 +39,16 @@ bot = MousBot()
 # ----------------------------
 # Reaction roles configuration
 # ----------------------------
-# Map of message_id -> {emoji: role_id}
-# Example:
-# REACTION_ROLE_MAP = {
-#     123456789012345678: {
-#         "✅": 111111111111111111,
-#         "🎨": 222222222222222222,
-#     }
-# }
-REACTION_ROLE_MAP: dict[int, dict[str, int]] = {}
+REACTION_ROLE_MAP: Dict[int, Dict[str, int]] = {}
 
 # ----------------------------
 # Auto reaction configuration
 # ----------------------------
-# React to any message in listed channels with the given emoji list.
-# Example:
-# AUTO_REACT_CHANNELS = {
-#     333333333333333333: ["✨", "❤️"],
-# }
-AUTO_REACT_CHANNELS: dict[int, list[str]] = {}
-
-# React to messages containing keywords (case-insensitive).
-# Example:
-# AUTO_REACT_KEYWORDS = {
-#     "mous": ["🐭"],
-#     "nice": ["✅", "👏"],
-# }
-AUTO_REACT_KEYWORDS: dict[str, list[str]] = {}
+AUTO_REACT_CHANNELS: Dict[int, list[str]] = {}
+AUTO_REACT_KEYWORDS: Dict[str, list[str]] = {}
 
 
-async def fetch_payload(url: str) -> dict:
+async def fetch_payload(url: str) -> Any:
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url) as resp:
@@ -75,7 +58,7 @@ async def fetch_payload(url: str) -> dict:
             return await resp.json()
 
 
-def unwrap_data(payload: object) -> dict:
+def unwrap_data(payload: Any) -> dict:
     cur = payload
     for _ in range(6):
         if isinstance(cur, dict) and "data" in cur:
@@ -146,7 +129,7 @@ def build_embed(payload: dict) -> discord.Embed:
     return embed
 
 
-def load_last_post_date() -> str | None:
+def load_last_post_date() -> Optional[str]:
     try:
         with open(DAILY_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -168,20 +151,20 @@ def save_last_post_date(date_str: str) -> None:
         pass
 
 
-async def get_random_mous_full() -> dict:
+async def get_random_mous_full() -> Any:
     """
     /mous/random returns only {"id": "..."} in your case.
     So we fetch /mous/{id} afterwards.
     """
     rand_payload = await fetch_payload(f"{API_BASE}/random")
 
-    # If random endpoint already returns full data, just use it
     rand_data = unwrap_data(rand_payload)
     maybe_username = first_present(rand_data, "username", "text", "memory_date", "category")
-    if maybe_username is not None and ("text" in rand_data or "username" in rand_data or "memory_date" in rand_data):
+    if maybe_username is not None and (
+        "text" in rand_data or "username" in rand_data or "memory_date" in rand_data
+    ):
         return rand_payload
 
-    # Otherwise, expect {"id": "..."}
     rand_id = first_present(rand_payload, "id", "ID")
     if not isinstance(rand_id, str) or not rand_id.strip():
         raise RuntimeError(f"/mous/random did not return an id. Got: {rand_payload}")
@@ -239,9 +222,7 @@ async def mous_debug(interaction: discord.Interaction):
 bot.tree.add_command(mous_group)
 
 
-@tasks.loop(
-    time=dt_time(hour=0, minute=0, tzinfo=ZoneInfo(DAILY_TIMEZONE)),
-)
+@tasks.loop(time=dt_time(hour=0, minute=0, tzinfo=ZoneInfo(DAILY_TIMEZONE)))
 async def daily_mous():
     today = datetime.now(tz=ZoneInfo(DAILY_TIMEZONE)).date().isoformat()
     if load_last_post_date() == today:
@@ -253,6 +234,10 @@ async def daily_mous():
             channel = await bot.fetch_channel(DAILY_CHANNEL_ID)
         except discord.HTTPException:
             return
+
+    # If the fetched channel isn't messageable, stop
+    if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+        return
 
     try:
         payload = await get_random_mous_full()
@@ -271,6 +256,12 @@ async def daily_mous():
         pass
 
 
+@daily_mous.before_loop
+async def before_daily_mous():
+    # Ensure bot is logged in and ready before task runs
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
@@ -278,11 +269,9 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bot messages to prevent loops.
     if message.author.bot:
         return
 
-    # Channel-based auto reactions.
     channel_emojis = AUTO_REACT_CHANNELS.get(message.channel.id)
     if channel_emojis:
         for emoji in channel_emojis:
@@ -291,7 +280,6 @@ async def on_message(message: discord.Message):
             except discord.HTTPException:
                 pass
 
-    # Keyword-based auto reactions.
     if AUTO_REACT_KEYWORDS and message.content:
         content_lower = message.content.lower()
         for keyword, emojis in AUTO_REACT_KEYWORDS.items():
@@ -307,7 +295,7 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
+    if bot.user and payload.user_id == bot.user.id:
         return
     role_map = REACTION_ROLE_MAP.get(payload.message_id)
     if not role_map:
@@ -366,6 +354,4 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
-    keep_alive()
     bot.run(TOKEN)
-
