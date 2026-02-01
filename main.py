@@ -3,7 +3,6 @@ import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
-from keep_alive import keep_alive
 from discord.ext import tasks
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
@@ -369,3 +368,4 @@ if __name__ == "__main__":
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
     keep_alive()
     bot.run(TOKEN)
+
