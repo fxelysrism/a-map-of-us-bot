@@ -1,5 +1,6 @@
 import os
 import aiohttp
+from aiohttp import web
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -7,6 +8,7 @@ from discord.ext import tasks
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 import json
+import sys
 from typing import Optional  # ← ADDED (needed for Railway-safe typing)
 
 API_BASE = "https://api.amapof.us/mous"
@@ -14,6 +16,8 @@ TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DAILY_CHANNEL_ID = 1466859419781435392
 DAILY_TIMEZONE = "Europe/London"
 DAILY_STATE_FILE = "daily_post.json"
+GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
+HEALTH_RUNNER: Optional[web.AppRunner] = None
 
 # ============================
 # STATUS CONFIG (ADDED)
@@ -31,7 +35,17 @@ class MousBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        await self.tree.sync()
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=GUILD_ID)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+            else:
+                await self.tree.sync()
+        except Exception as exc:
+            print(f"[ERROR] Slash command sync failed: {exc}")
+
+        await start_health_server()
         if not daily_mous.is_running():
             daily_mous.start()
 
@@ -125,6 +139,35 @@ def save_last_post_date(date_str: str) -> None:
         pass
 
 
+def is_admin(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return False
+    perms = interaction.user.guild_permissions
+    return perms.administrator or perms.manage_guild
+
+
+async def start_health_server() -> None:
+    global HEALTH_RUNNER
+    port_str = os.environ.get("PORT")
+    if not port_str:
+        return
+    if HEALTH_RUNNER is not None:
+        return
+
+    port = int(port_str)
+
+    async def _health(_: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    HEALTH_RUNNER = runner
+
+
 @tasks.loop(time=dt_time(hour=0, minute=0, tzinfo=ZoneInfo(DAILY_TIMEZONE)))
 async def daily_mous():
     today = datetime.now(tz=ZoneInfo(DAILY_TIMEZONE)).date().isoformat()
@@ -158,6 +201,51 @@ async def on_ready():
         activity=activity
     )
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+
+
+@bot.tree.command(name="mous_random", description="Get a random memory from A Map of Us.")
+async def mous_random(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        payload = await fetch_payload(f"{API_BASE}/random")
+        embed = build_embed(payload)
+        await interaction.followup.send(embed=embed)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to fetch memory: {exc}")
+
+
+@bot.tree.command(name="reload_commands", description="Reload slash commands (sync).")
+@app_commands.check(is_admin)
+async def reload_commands(interaction: discord.Interaction):
+    if interaction.guild is not None:
+        commands_synced = await bot.tree.sync(guild=interaction.guild)
+    else:
+        commands_synced = await bot.tree.sync()
+    await interaction.response.send_message(
+        f"Reloaded {len(commands_synced)} slash commands.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="restart", description="Restart the bot process.")
+@app_commands.check(is_admin)
+async def restart(interaction: discord.Interaction):
+    await interaction.response.send_message("Restarting...", ephemeral=True)
+
+    async def _restart():
+        await bot.close()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    bot.loop.create_task(_restart())
+
+
+@reload_commands.error
+@restart.error
+async def admin_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"Command failed: {error}", ephemeral=True)
 
 
 if __name__ == "__main__":
